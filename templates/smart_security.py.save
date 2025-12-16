@@ -1,0 +1,139 @@
+import cv2
+import numpy as np
+import os, json, threading, time
+from datetime import datetime
+from flask import Flask, render_template, request, redirect, url_for, send_from_directory, Response
+import requests # <-- Nytt bibliotek for API-kall
+
+# --- Konfigurasjon ---
+# PEK PÅ DIN DATABASE PC!
+DB_API_URL = "http://<172.16.1.24>:5001" 
+DATA_FILE = "data.json" # Fortsatt brukt for lokal caching av kjente ansikter
+DB_FOLDER = "database" # Kun for midlertidig lagring/testing (kan fjernes om ønskelig)
+
+# Load existing data (Cacher kun kjent data for gjenkjenning)
+try:
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            known_faces = json.load(f)
+    else:
+        known_faces = {}
+except json.JSONDecodeError:
+    known_faces = {}
+    
+# ... (Resten av INITIALISERINGEN er uendret) ...
+# (PROTOTXT, CAFFE_MODEL, recognizer, net, new_persons, model_trained, lock)
+
+# --- VIKTIG: save_image må nå sende data til API-et ---
+
+def save_image_via_api(face_img):
+    """Lagrer et bilde ved å sende det til Database PC-en via API."""
+    now = datetime.now()
+    filename = f"{now.strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+    data_ts = now.isoformat()
+    
+    # 1. Konverter bildet (cv2-objektet) til JPEG-bytes
+    _, buffer = cv2.imencode('.jpg', face_img)
+    image_bytes = buffer.tobytes()
+    
+    # 2. Sett opp POST-forespørselen
+    files = {'image': (filename, image_bytes, 'image/jpeg')}
+    data = {'timestamp': data_ts}
+    
+    try:
+        # Sender bilde og metadata til API-et på Database PC
+        response = requests.post(f"{DB_API_URL}/save_image", files=files, data=data)
+        response.raise_for_status() # Håndterer feil som 4xx/5xx
+        
+        # API-et vil returnere filnavn og tidsstempel i bekreftelsen
+        return filename, data_ts 
+        
+    except requests.exceptions.RequestException as e:
+        print(f"[API ERROR] Kunne ikke koble til eller lagre data på DB PC: {e}")
+        # HVIS API feiler, lagrer vi lokalt som en fallback
+        # Dette sikrer at vi ikke mister data ved nettverksfeil
+        path = os.path.join(DB_FOLDER, filename)
+        cv2.imwrite(path, face_img)
+        return filename, data_ts
+
+# --- Flask Routes (På Pi-en) ---
+
+@app.route("/")
+def index():
+    # Dette kan du nå endre til å hente data fra API-et!
+    # For enkelthets skyld lar vi det fortsatt vise den lokale new_persons listen
+    try:
+        response = requests.get(f"{DB_API_URL}/get_data")
+        response.raise_for_status()
+        data = response.json()
+        global known_faces 
+        known_faces = data['known_faces'] # Oppdaterer lokal cache
+        
+        # Henter new_persons fra API
+        current_new_persons = data['new_persons'] 
+        
+    except requests.exceptions.RequestException as e:
+        print(f"[API ERROR] Klarte ikke hente fersk data: {e}")
+        # Bruker lokal data hvis API feiler
+        current_new_persons = new_persons
+
+    sorted_new_persons = sorted(current_new_persons, key=lambda x: x['timestamp'], reverse=True)
+    
+    return render_template("index.html", 
+                           new_persons=sorted_new_persons, 
+                           known_faces=known_faces,
+                           db_url=DB_API_URL) # Sender URL for å vise i GUI
+
+@app.route("/add_name/<filename>", methods=["POST"])
+def add_name(filename):
+    name = request.form.get("name")
+    
+    try:
+        # Sender kommando til API-et om å registrere en person
+        response = requests.post(f"{DB_API_URL}/register_person/{filename}", data={'name': name})
+        response.raise_for_status()
+        
+        # Tvinger en ny trening etter registrering (gjennom API-et)
+        requests.post(f"{DB_API_URL}/train_model") 
+        
+        # Re-trener også den LOKALE modellen på Pi-en
+        global current_label_map 
+        current_label_map = train_recognizer()
+        
+    except requests.exceptions.RequestException as e:
+        print(f"[API ERROR] Klarte ikke registrere person: {e}")
+
+    return redirect(url_for("index"))
+
+# ... (Endre også /delete_image til å bruke API-kall) ...
+
+# --- Camera Thread (Oppdatert) ---
+
+def camera_loop():
+    # ... (Kamera initialisering og deteksjon er uendret) ...
+    # ... (Inne i face detection loop) ...
+
+        # 4. Recognize and Save
+        if current_time - last_save_time > SAVE_COOLDOWN:
+            
+            # Må hente fersk label_map fra API for å unngå feil
+            # Dette er en trade-off - raskere å bruke lokal cache
+            # Men for nøyaktighet er det best å hente den etter en trening
+            # VIKTIG: La oss bruke lokal cache for å holde ytelsen oppe!
+            
+            pid, conf = recognize_face(face_roi) 
+            
+            # Bruker den nye API-lagringsfunksjonen
+            filename, data_ts = save_image_via_api(face_roi) 
+            
+            # ... (Resten av logikken for å sjekke PID kan nå forenkles
+            # siden lagringen og oppdateringen skjer på DB-serveren) ...
+            
+            last_save_time = current_time
+
+# Start camera in background
+threading.Thread(target=camera_loop, daemon=True).start()
+
+if __name__ == "__main__":
+    # Kjører Pi-klienten på port 5000
+    app.run(host="0.0.0.0", port=5000, debug=False)

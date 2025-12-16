@@ -1,0 +1,10 @@
+body {
+    background: #121212;
+    color: #eee;
+    font-family: monospace;
+}
+
+h1, h2 { color: #f39c12; }
+button { background: #333; color: #f39c12; border: none; padding: 5px 10px; cursor: pointer; }
+input { padding:5px; margin:5px; }
+img { margin:5px; border:2px solid #f39c12; }
